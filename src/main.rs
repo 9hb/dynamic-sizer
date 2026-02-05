@@ -74,7 +74,7 @@ fn main() -> io::Result<()> {
     let temp_path = priprav_temp_file(&exec_path, cilovy_bajty)?;
     spust_script(&exec_path, &temp_path)?;
 
-    println!("the executable will change its size after exit", formatuj_velikost(cilovy_bajty));
+    println!("the executable will change its size after exit {}", formatuj_velikost(cilovy_bajty));
 
     Ok(())
 }
