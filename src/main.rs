@@ -15,6 +15,12 @@ fn ziskej_velikost(cesta: &Path) -> io::Result<u128> {
 
     soubor.read_exact(&mut buffer)?;
 
+    // ELF format
+    if &buffer[0..4] == b"\x7fELF" {
+        return ziskej_velikost_elf(&mut soubor, &buffer);
+    }
+
+    // PE format
     if &buffer[0..2] != b"MZ" {
         return Ok(u128::from(fs::metadata(cesta)?.len()));
     }
@@ -55,6 +61,99 @@ fn ziskej_velikost(cesta: &Path) -> io::Result<u128> {
         let konec_sekce = u64::from(raw_offset) + u64::from(raw_velikost);
         if konec_sekce > max_konec {
             max_konec = konec_sekce;
+        }
+    }
+
+    Ok(u128::from(max_konec))
+}
+
+fn ziskej_velikost_elf(soubor: &mut File, buffer: &[u8; 64]) -> io::Result<u128> {
+    use std::io::{ Read, Seek, SeekFrom };
+
+    let is_64bit = buffer[4] == 2;
+    let little_endian = buffer[5] == 1;
+
+    if !little_endian {
+        return Ok(u128::from(soubor.metadata()?.len()));
+    }
+
+    let (e_shoff, e_shentsize, e_shnum) = if is_64bit {
+        let e_shoff = u64::from_le_bytes([
+            buffer[40],
+            buffer[41],
+            buffer[42],
+            buffer[43],
+            buffer[44],
+            buffer[45],
+            buffer[46],
+            buffer[47],
+        ]);
+        let e_shentsize = u16::from_le_bytes([buffer[58], buffer[59]]);
+        let e_shnum = u16::from_le_bytes([buffer[60], buffer[61]]);
+        (e_shoff, e_shentsize, e_shnum)
+    } else {
+        let e_shoff = u32::from_le_bytes([buffer[32], buffer[33], buffer[34], buffer[35]]);
+        let e_shentsize = u16::from_le_bytes([buffer[46], buffer[47]]);
+        let e_shnum = u16::from_le_bytes([buffer[48], buffer[49]]);
+        (e_shoff as u64, e_shentsize, e_shnum)
+    };
+
+    let mut max_konec = 0u64;
+
+    for i in 0..e_shnum {
+        let offset = e_shoff + (i as u64) * (e_shentsize as u64);
+        soubor.seek(SeekFrom::Start(offset))?;
+
+        if is_64bit {
+            let mut sekce_buffer = [0u8; 64];
+            soubor.read_exact(&mut sekce_buffer)?;
+
+            let sh_offset = u64::from_le_bytes([
+                sekce_buffer[24],
+                sekce_buffer[25],
+                sekce_buffer[26],
+                sekce_buffer[27],
+                sekce_buffer[28],
+                sekce_buffer[29],
+                sekce_buffer[30],
+                sekce_buffer[31],
+            ]);
+            let sh_size = u64::from_le_bytes([
+                sekce_buffer[32],
+                sekce_buffer[33],
+                sekce_buffer[34],
+                sekce_buffer[35],
+                sekce_buffer[36],
+                sekce_buffer[37],
+                sekce_buffer[38],
+                sekce_buffer[39],
+            ]);
+
+            let konec_sekce = sh_offset + sh_size;
+            if konec_sekce > max_konec {
+                max_konec = konec_sekce;
+            }
+        } else {
+            let mut sekce_buffer = [0u8; 40];
+            soubor.read_exact(&mut sekce_buffer)?;
+
+            let sh_offset = u32::from_le_bytes([
+                sekce_buffer[16],
+                sekce_buffer[17],
+                sekce_buffer[18],
+                sekce_buffer[19],
+            ]);
+            let sh_size = u32::from_le_bytes([
+                sekce_buffer[20],
+                sekce_buffer[21],
+                sekce_buffer[22],
+                sekce_buffer[23],
+            ]);
+
+            let konec_sekce = (sh_offset as u64) + (sh_size as u64);
+            if konec_sekce > max_konec {
+                max_konec = konec_sekce;
+            }
         }
     }
 
@@ -189,6 +288,19 @@ fn priprav_temp_file(exec_path: &Path, cilovy_bajty: u128) -> io::Result<PathBuf
 }
 
 fn spust_script(sc_target: &Path, sc_source: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        spust_script_windows(sc_target, sc_source)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        spust_script_linux(sc_target, sc_source)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn spust_script_windows(sc_target: &Path, sc_source: &Path) -> io::Result<()> {
     let mut nazev_sc = sc_target
         .file_name()
         .map(|jmeno| jmeno.to_os_string())
@@ -233,6 +345,62 @@ fn spust_script(sc_target: &Path, sc_source: &Path) -> io::Result<()> {
     fs::write(&sc_path, obsah)?;
 
     Command::new("cmd").arg("/C").arg(&sc_path).spawn()?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn spust_script_linux(sc_target: &Path, sc_source: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut nazev_sc = sc_target
+        .file_name()
+        .map(|jmeno| jmeno.to_os_string())
+        .unwrap_or_else(|| OsString::from("dynamic-sizer"));
+    nazev_sc.push(".swap.sh");
+    let sc_path = sc_target.with_file_name(nazev_sc);
+
+    if sc_path.exists() {
+        let _ = fs::remove_file(&sc_path);
+    }
+
+    let sc_target_text = sc_target.as_os_str().to_string_lossy().into_owned();
+    let sc_source_text = sc_source.as_os_str().to_string_lossy().into_owned();
+    let sc_path_text = sc_path.as_os_str().to_string_lossy().into_owned();
+
+    let obsah = format!(
+        concat!(
+            "#!/bin/bash\n",
+            "SOURCE=\"{}\"\n",
+            "TARGET=\"{}\"\n",
+            "SCRIPT=\"{}\"\n",
+            "\n",
+            "for i in {{1..300}}; do\n",
+            "    sleep 1\n",
+            "    rm -f \"$TARGET\" 2>/dev/null\n",
+            "    if [ ! -e \"$TARGET\" ]; then\n",
+            "        mv -f \"$SOURCE\" \"$TARGET\" 2>/dev/null\n",
+            "        if [ ! -e \"$SOURCE\" ]; then\n",
+            "            break\n",
+            "        fi\n",
+            "    fi\n",
+            "done\n",
+            "\n",
+            "rm -f \"$SOURCE\" 2>/dev/null\n",
+            "rm -f \"$SCRIPT\" 2>/dev/null\n"
+        ),
+        sc_source_text,
+        sc_target_text,
+        sc_path_text
+    );
+
+    fs::write(&sc_path, obsah)?;
+
+    let mut perms = fs::metadata(&sc_path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&sc_path, perms)?;
+
+    Command::new(&sc_path).spawn()?;
 
     Ok(())
 }
